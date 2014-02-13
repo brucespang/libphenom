@@ -47,34 +47,6 @@ static uint32_t num_cores = 0;
 static void detect_cores(void)
 {
   num_cores = sysconf(_SC_NPROCESSORS_ONLN);
-#ifdef __linux__
-  {
-    char buf[256];
-    int fd;
-    int divisor = 1;
-
-    // Comma separated list of HT siblings.
-    // We're assuming that if HT is present, it is symmetric and applies
-    // evenly to all cores in the system.
-    fd = open(
-        "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
-        O_RDONLY);
-    if (fd >= 0) {
-      int x = read(fd, buf, sizeof(buf));
-      int i;
-
-      for (i = 0; i < x; i++) {
-        if (buf[i] == ',') {
-          // Each comma represents a shared core
-          divisor++;
-        }
-      }
-      close(fd);
-    }
-
-    num_cores /= divisor;
-  }
-#endif
 #ifdef __APPLE__
   {
     unsigned ncores;
@@ -113,6 +85,7 @@ CK_STACK_CONTAINER(ph_thread_t,
 
 static void thread_fini(void)
 {
+#ifdef PH_PLACATE_VALGRIND
   ck_stack_entry_t *stack_entry;
   ph_thread_t *thr;
 
@@ -121,6 +94,7 @@ static void thread_fini(void)
     ph_counter_tear_down_thread(thr);
     free(thr);
   }
+#endif
 }
 
 static void thread_init(void)

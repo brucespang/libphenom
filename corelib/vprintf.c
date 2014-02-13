@@ -122,7 +122,9 @@ static struct ph_ht_val_def val_def = {
 
 static void fini_vprintf(void)
 {
+#ifdef PH_PLACATE_VALGRIND
   ph_ht_destroy(&formatters);
+#endif
 }
 
 static void init_vprintf(void)
@@ -576,11 +578,21 @@ ph_vprintf_core(void *print_arg,
 
           if (!memcmp("%p", fmt + 3, 2)) {
             str = GETARG(void*);
+            if (!str) {
+              PRINT("(null)", 6);
+              ret += 6;
+              continue;
+            }
             len = str->len;
             fmt += 5;
           } else if (!memcmp("%d%p", fmt + 3, 4)) {
             len = GETARG(int);
             str = GETARG(void*);
+            if (!str) {
+              PRINT("(null)", 6);
+              ret += 6;
+              continue;
+            }
             len = MIN(len, str->len);
             fmt += 7;
           } else {
