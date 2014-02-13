@@ -55,6 +55,8 @@ static struct {
 } mt;
 static int ssl_sock_idx;
 
+static uint32_t connect_affinity = 0;
+
 ph_socket_t ph_socket_for_addr(const ph_sockaddr_t *addr, int type, int flags)
 {
   ph_socket_t s;
@@ -98,12 +100,12 @@ static void connect_complete(ph_job_t *j, ph_iomask_t why, void *data)
   done = ph_time_now();
   timersub(&done, &job->start, &done);
 
-  // Ensure that we de-schedule the fd from this emitter, in case it gets
-  // associated with a different one later
-  ph_job_set_nbio(&job->job, 0, NULL);
+  // This defers the free, so we are still safe to access job on
+  // the following line
+  ph_job_free(&job->job);
+  job->job.fd = -1;
 
   job->func(job->s, &job->addr, status, &done, job->arg);
-  ph_job_free(&job->job);
 }
 
 static void sock_dtor(ph_job_t *job)
@@ -112,30 +114,37 @@ static void sock_dtor(ph_job_t *job)
 
   if (sock->sslwbuf) {
     ph_bufq_free(sock->sslwbuf);
+    sock->sslwbuf = NULL;
   }
   if (sock->ssl) {
     SSL_CTX *ctx = sock->ssl->ctx;
 
     if (sock->ssl_stream) {
       ph_stm_close(sock->ssl_stream);
+      sock->ssl_stream = NULL;
     } else {
       SSL_free(sock->ssl);
     }
+    sock->ssl = NULL;
 
     SSL_CTX_free(ctx);
   }
 
   if (sock->wbuf) {
     ph_bufq_free(sock->wbuf);
+    sock->wbuf = NULL;
   }
   if (sock->rbuf) {
     ph_bufq_free(sock->rbuf);
+    sock->rbuf = NULL;
   }
   if (sock->conn) {
     ph_stm_close(sock->conn);
+    sock->conn = NULL;
   }
   if (sock->stream) {
     ph_stm_close(sock->stream);
+    sock->stream = NULL;
   }
 }
 
@@ -184,78 +193,125 @@ static bool try_read(ph_sock_t *sock)
 static void sock_dispatch(ph_job_t *j, ph_iomask_t why, void *data)
 {
   ph_sock_t *sock = (ph_sock_t*)j;
+  bool had_err = why & PH_IOMASK_ERR;
 
-  sock->conn->need_mask = 0;
-
-  // Push data into the SSL stream
-  if (sock->sslwbuf) {
-    try_ssl_shunt(sock);
-    why |= PH_IOMASK_WRITE;
+  if (j->def && j->epoch_entry.function) {
+    // We're being woken up after we've been freed.
+    // This is fugly.  Really.
+    return;
   }
-
-  // If we have data pending write, try to get that sent, and flag
-  // errors
-  if (sock->enabled && !try_send(sock)) {
-    why |= PH_IOMASK_ERR;
-  }
-
-  if (sock->enabled &&
-      (why & (PH_IOMASK_READ|PH_IOMASK_ERR)) == PH_IOMASK_READ) {
-    if (!try_read(sock)) {
-      why |= PH_IOMASK_ERR;
-    }
-  }
-
-  if (sock->enabled && sock->ssl && SSL_in_init(sock->ssl)
-      && SSL_total_renegotiations(sock->ssl) == 0) {
-    switch (SSL_get_error(sock->ssl, SSL_do_handshake(sock->ssl))) {
-      case SSL_ERROR_NONE:
-        break;
-      case SSL_ERROR_WANT_READ:
-        if (try_send(sock)) {
-          ph_job_set_nbio_timeout_in(&sock->job,
-              PH_IOMASK_READ,
-              sock->timeout_duration);
-          return;
-        }
-        why |= PH_IOMASK_ERR;
-        break;
-      case SSL_ERROR_WANT_WRITE:
-        if (try_send(sock)) {
-          ph_job_set_nbio_timeout_in(&sock->job,
-              PH_IOMASK_WRITE,
-              sock->timeout_duration);
-          return;
-        }
-        why |= PH_IOMASK_ERR;
-        break;
-      default:
-        why |= PH_IOMASK_ERR;
-        break;
-    }
-  }
-
-  sock->callback(sock, why, data);
-
-  try_ssl_shunt(sock);
 
   if (sock->enabled) {
+    sock->conn->need_mask = 0;
+
+    // Push data into the SSL stream
+    if (sock->sslwbuf) {
+      if (try_ssl_shunt(sock)) {
+        why |= PH_IOMASK_WRITE;
+      } else {
+        why |= PH_IOMASK_ERR;
+      }
+    }
+
+    // If we have data pending write, try to get that sent, and flag
+    // errors
     if (!try_send(sock)) {
-      sock->callback(sock, PH_IOMASK_ERR, data);
+      why |= PH_IOMASK_ERR;
     }
 
-    ph_iomask_t mask = sock->conn->need_mask | PH_IOMASK_READ;
-
-    if (ph_bufq_len(sock->wbuf) ||
-        (sock->sslwbuf && ph_bufq_len(sock->sslwbuf))) {
-      mask |= PH_IOMASK_WRITE;
+    if ((why & PH_IOMASK_ERR) == 0) {
+      if (!try_read(sock)) {
+        why |= PH_IOMASK_ERR;
+      }
     }
 
-    ph_log(PH_LOG_DEBUG, "fd=%d setting mask=%x timeout={%d,%d}",
-        sock->job.fd, mask, (int)sock->timeout_duration.tv_sec,
-        (int)sock->timeout_duration.tv_usec);
-    ph_job_set_nbio_timeout_in(&sock->job, mask, sock->timeout_duration);
+    if (sock->ssl && SSL_in_init(sock->ssl)
+        && SSL_total_renegotiations(sock->ssl) == 0) {
+      switch (SSL_get_error(sock->ssl, SSL_do_handshake(sock->ssl))) {
+        case SSL_ERROR_NONE:
+          break;
+        case SSL_ERROR_WANT_READ:
+          if (try_send(sock)) {
+            ph_job_set_nbio_timeout_in(&sock->job,
+                PH_IOMASK_READ,
+                sock->timeout_duration);
+            return;
+          }
+          why |= PH_IOMASK_ERR;
+          break;
+        case SSL_ERROR_WANT_WRITE:
+          if (try_send(sock)) {
+            ph_job_set_nbio_timeout_in(&sock->job,
+                PH_IOMASK_WRITE,
+                sock->timeout_duration);
+            return;
+          }
+          why |= PH_IOMASK_ERR;
+          break;
+        default:
+          why |= PH_IOMASK_ERR;
+          break;
+      }
+    }
   }
+
+dispatch_again:
+  if (why & PH_IOMASK_ERR) {
+    had_err = true;
+  }
+  if (sock->enabled || (why & PH_IOMASK_WAKEUP) || (why & PH_IOMASK_ERR)) {
+    sock->callback(sock, why, data);
+  }
+
+  if (!sock->enabled) {
+    return;
+  }
+
+  if (!had_err) {
+    uint64_t rbufsize = ph_bufq_len(sock->rbuf);
+
+    if (!try_ssl_shunt(sock)) {
+      why = PH_IOMASK_ERR;
+      goto dispatch_again;
+    }
+
+    if (!try_send(sock)) {
+      why = PH_IOMASK_ERR;
+      goto dispatch_again;
+    } else if (sock->ssl_stream) {
+      // SSL writes can also read; while it remains buffered
+      // in the SSL structure, we don't see it in rbuf and won't
+      // get woken up by epoll.  If we hit that case, we perform
+      // this speculative read, and if the rbuf_len changes we
+      // know that we should make another attempt at dispatching
+      // to read the remainder
+      if (!try_read(sock)) {
+        why = PH_IOMASK_ERR;
+        goto dispatch_again;
+      }
+
+      if (ph_bufq_len(sock->rbuf) > rbufsize) {
+        why = PH_IOMASK_READ;
+        goto dispatch_again;
+      }
+    }
+  }
+
+  ph_iomask_t mask = sock->conn->need_mask | PH_IOMASK_READ;
+
+  if (sock->ssl_stream) {
+    mask |= sock->ssl_stream->need_mask;
+  }
+
+  if (ph_bufq_len(sock->wbuf) ||
+      (sock->sslwbuf && ph_bufq_len(sock->sslwbuf))) {
+    mask |= PH_IOMASK_WRITE;
+  }
+
+  ph_log(PH_LOG_DEBUG, "fd=%d setting mask=%x timeout={%d,%d}",
+      sock->job.fd, mask, (int)sock->timeout_duration.tv_sec,
+      (int)sock->timeout_duration.tv_usec);
+  ph_job_set_nbio_timeout_in(&sock->job, mask, sock->timeout_duration);
 }
 
 static struct ph_job_def connect_job_template = {
@@ -298,6 +354,7 @@ void ph_socket_connect(ph_socket_t s, const ph_sockaddr_t *addr,
   job->addr = *addr;
   job->func = func;
   job->arg = arg;
+  job->job.emitter_affinity = ck_pr_faa_32(&connect_affinity, 1);
 
   job->start = ph_time_now();
   res = connect(s, &job->addr.sa.sa, ph_sockaddr_socklen(&job->addr));
@@ -306,7 +363,6 @@ void ph_socket_connect(ph_socket_t s, const ph_sockaddr_t *addr,
     // Pending; let's set things up to call us back later
 
     job->job.fd = s;
-    job->job.callback = connect_complete;
     job->job.data = job;
     ph_job_set_nbio_timeout_in(&job->job, PH_IOMASK_WRITE,
         timeout ? *timeout : default_timeout);
@@ -321,7 +377,6 @@ void ph_socket_connect(ph_socket_t s, const ph_sockaddr_t *addr,
   ph_job_free(&job->job);
 }
 
-// Should probably be configurable
 #define MAX_SOCK_BUFFER_SIZE 128*1024
 
 static bool sock_stm_close(ph_stream_t *stm)
@@ -472,7 +527,7 @@ fail:
 
 void ph_sock_free(ph_sock_t *sock)
 {
-  ph_sock_enable(sock, false);
+  sock->enabled = false;
   ph_job_free(&sock->job);
 }
 
